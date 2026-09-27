@@ -1,5 +1,5 @@
 import time
-from collections.abc import Generator, Sequence
+from collections.abc import Generator, Iterable, Iterator, Sequence
 from pathlib import Path
 from typing import IO, Any, Literal
 from urllib.parse import parse_qsl
@@ -13,6 +13,23 @@ from .exceptions import UploadRejectedError
 
 DEFAULT_TIMEOUT = 60
 RETRIES = 10
+_API_UPLOAD_CHUNK_SIZE = 256 * 1024
+
+
+class _FileChunkStream(Iterable[bytes]):
+
+    def __init__(self, file_path: str | Path, chunk_size: int = _API_UPLOAD_CHUNK_SIZE) -> None:
+        self._path = Path(file_path)
+        self._total = self._path.stat().st_size
+        self._chunk_size = chunk_size
+
+    def __len__(self) -> int:
+        return self._total
+
+    def __iter__(self) -> Iterator[bytes]:
+        with self._path.open("rb") as f:
+            while chunk := f.read(self._chunk_size):
+                yield chunk
 
 
 class Api:
@@ -193,12 +210,12 @@ class Api:
         media_key = decoded_message["1"].get("2", {}).get("2", {}).get("1", None)
         return media_key
 
-    def upload_file(self, file: str | Path | bytes | IO[bytes] | Generator[bytes, None, None], upload_token: str) -> dict:
+    def upload_file(self, file: str | Path | bytes | IO[bytes] | Iterable[bytes] | Generator[bytes, None, None], upload_token: str) -> dict:
         """
         Upload a file to Google Photos.
 
         Args:
-            file: The file to upload. Can be a path (str or Path), bytes, BufferedReader, or a generator yielding bytes.
+            file: The file to upload. Can be a path (str or Path), bytes, BufferedReader, or an iterable/generator yielding bytes.
             upload_token Upload token from `get_upload_token()`.
 
         Returns:
@@ -217,13 +234,13 @@ class Api:
 
         with self._new_session() as session:
             if isinstance(file, (str, Path)):
-                with Path(file).open("rb") as f:
-                    response = session.put(
-                        f"https://photos.googleapis.com/data/upload/uploadmedia/interactive?upload_id={upload_token}",
-                        headers=headers,
-                        timeout=self.timeout,
-                        data=f,
-                    )
+                file = _FileChunkStream(file)
+                response = session.put(
+                    f"https://photos.googleapis.com/data/upload/uploadmedia/interactive?upload_id={upload_token}",
+                    headers=headers,
+                    timeout=self.timeout,
+                    data=file,
+                )
             else:
                 response = session.put(
                     f"https://photos.googleapis.com/data/upload/uploadmedia/interactive?upload_id={upload_token}",

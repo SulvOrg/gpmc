@@ -3,7 +3,7 @@ import os
 import re
 import signal
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from datetime import datetime
@@ -94,6 +94,49 @@ class _ProgressReader:
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._file, name)
+
+
+_UPLOAD_CHUNK_SIZE = 256 * 1024
+
+
+class _UploadStream(Iterable[bytes]):
+
+    def __init__(
+        self,
+        file_path: str | Path,
+        total: int,
+        chunk_size: int = _UPLOAD_CHUNK_SIZE,
+        progress: Progress | None = None,
+        task_id: TaskID | None = None,
+        on_progress: Callable[[int, int], None] | None = None,
+    ) -> None:
+        self._file_path = Path(file_path)
+        self._total = total
+        self._chunk_size = chunk_size
+        self._progress = progress
+        self._task_id = task_id
+        self._on_progress = on_progress
+
+    def __len__(self) -> int:
+        return self._total
+
+    def __iter__(self) -> Iterator[bytes]:
+        completed = 0
+        last_report = 0.0
+        with self._file_path.open("rb") as f:
+            while True:
+                data = f.read(self._chunk_size)
+                if not data:
+                    break
+                completed += len(data)
+                if self._progress is not None and self._task_id is not None:
+                    self._progress.advance(self._task_id, advance=len(data))
+                if self._on_progress is not None:
+                    now = time.monotonic()
+                    if now - last_report >= 0.25 or completed >= self._total:
+                        last_report = now
+                        self._on_progress(completed, self._total)
+                yield data
 
 
 class Client:
@@ -240,11 +283,17 @@ class Client:
                     return {file_path.absolute().as_posix(): remote_media_key}
 
             upload_token = self.api.get_upload_token(hash_b64, file_size)
-            progress.reset(task_id=file_progress_id)
+            progress.reset(task_id=file_progress_id, total=file_size)
             progress.update(task_id=file_progress_id, description=f"Uploading: {file_path.name}")
-            with progress.open(file_path, "rb", task_id=file_progress_id) as file:
-                report("uploading")
-                upload_response = self.api.upload_file(file=_ProgressReader(file, file_size, lambda completed, _total: report("uploading", completed)), upload_token=upload_token)
+            report("uploading")
+            stream = _UploadStream(
+                file_path,
+                file_size,
+                progress=progress,
+                task_id=file_progress_id,
+                on_progress=lambda completed, _total: report("uploading", completed),
+            )
+            upload_response = self.api.upload_file(file=stream, upload_token=upload_token)
             report("finalizing", file_size)
             progress.update(task_id=file_progress_id, description=f"Finalizing Upload: {file_path.name}")
             last_modified_timestamp = int(file_path.stat().st_mtime)
